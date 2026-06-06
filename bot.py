@@ -159,6 +159,24 @@ def get_entry_diary_date(entry: dict[str, Any], diary_day_start: time) -> str | 
     return str(message_sent_date) if message_sent_date else None
 
 
+def parse_diary_date_argument(text: str, settings: Settings) -> tuple[str | None, str | None]:
+    normalized = text.strip().lower().replace("ё", "е")
+    tzinfo = settings.questions_time.tzinfo
+    current_diary_date = datetime.fromisoformat(
+        get_diary_date(datetime.now(tzinfo), settings.diary_day_start)
+    ).date()
+
+    if not normalized or normalized in {"сегодня", "today"}:
+        return current_diary_date.isoformat(), None
+    if normalized in {"вчера", "yesterday"}:
+        return (current_diary_date - timedelta(days=1)).isoformat(), None
+
+    try:
+        return datetime.strptime(normalized, "%Y-%m-%d").date().isoformat(), None
+    except ValueError:
+        return None, "Укажите дату как `2026-06-05`, `сегодня` или `вчера`."
+
+
 def read_questions() -> list[str]:
     if not QUESTIONS_PATH.exists():
         return DEFAULT_QUESTIONS
@@ -595,6 +613,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    await update.effective_message.reply_text(
+        "Доступные команды:\n"
+        "/start - начать работу и показать ID чата\n"
+        "/help - показать список команд\n"
+        "/last - показать последнюю запись дневника\n"
+        "/today - показать записи за текущий дневниковый день\n"
+        "/checkin - запустить ежедневную проверку самочувствия\n"
+        "/fasting - отметить текущий дневниковый день как разгрузочный\n\n"
+        "Для разгрузочного дня можно указать дату:\n"
+        "/fasting вчера\n"
+        "/fasting сегодня\n"
+        "/fasting 2026-06-05"
+    )
+
+
 async def last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_allowed(update, context):
         return
@@ -638,6 +675,33 @@ async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat:
         return
     await start_daily_checkin_for_chat(context, chat.id)
+
+
+async def fasting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    argument = " ".join(context.args or [])
+    diary_date, error = parse_diary_date_argument(argument, settings)
+    if error:
+        await update.effective_message.reply_text(error)
+        return
+
+    summary = f"Разгрузочный день: еды не было. Дата дневника: {diary_date}."
+    entry = build_entry(
+        update,
+        settings,
+        "fasting_day",
+        summary,
+        {
+            "marked_diary_date": diary_date,
+            "command_argument": argument,
+        },
+    )
+    entry["diary_date"] = diary_date
+    await save_entry(entry)
+    await update.effective_message.reply_text(f"Записал разгрузочный день за {diary_date}.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -720,9 +784,11 @@ def main() -> None:
     application.bot_data["settings"] = settings
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("last", last))
     application.add_handler(CommandHandler("today", today))
     application.add_handler(CommandHandler("checkin", checkin))
+    application.add_handler(CommandHandler("fasting", fasting))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
