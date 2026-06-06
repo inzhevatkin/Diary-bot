@@ -75,6 +75,7 @@ class Settings:
     telegram_token: str
     allowed_chat_ids: set[int]
     questions_time: time
+    diary_day_start: time
     timezone: str
     openai_api_key: str | None
     gigachat_api_key: str | None
@@ -102,11 +103,16 @@ def load_settings() -> Settings:
     except ZoneInfoNotFoundError as exc:
         raise RuntimeError(f"Unknown TIMEZONE: {timezone}") from exc
 
-    hour, minute = parse_hhmm(os.getenv("QUESTIONS_TIME", "20:00"))
+    hour, minute = parse_hhmm(os.getenv("QUESTIONS_TIME", "20:00"), "QUESTIONS_TIME")
+    diary_day_start_hour, diary_day_start_minute = parse_hhmm(
+        os.getenv("DIARY_DAY_START", "04:00"),
+        "DIARY_DAY_START",
+    )
     return Settings(
         telegram_token=token,
         allowed_chat_ids=allowed,
         questions_time=time(hour=hour, minute=minute, tzinfo=tzinfo),
+        diary_day_start=time(hour=diary_day_start_hour, minute=diary_day_start_minute),
         timezone=timezone,
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         gigachat_api_key=os.getenv("GIGACHAT_API_KEY") or os.getenv("GIGACHAT_CREDENTIALS") or None,
@@ -114,21 +120,43 @@ def load_settings() -> Settings:
     )
 
 
-def parse_hhmm(value: str) -> tuple[int, int]:
+def parse_hhmm(value: str, setting_name: str = "time setting") -> tuple[int, int]:
     try:
         hour_text, minute_text = value.split(":", maxsplit=1)
         hour = int(hour_text)
         minute = int(minute_text)
     except ValueError as exc:
-        raise RuntimeError("QUESTIONS_TIME must use HH:MM format, for example 20:00.") from exc
+        raise RuntimeError(f"{setting_name} must use HH:MM format, for example 20:00.") from exc
 
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise RuntimeError("QUESTIONS_TIME must use a valid 24-hour time.")
+        raise RuntimeError(f"{setting_name} must use a valid 24-hour time.")
     return hour, minute
 
 
 def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_diary_date(moment: datetime, diary_day_start: time) -> str:
+    diary_date = moment.date()
+    if (moment.hour, moment.minute) < (diary_day_start.hour, diary_day_start.minute):
+        diary_date -= timedelta(days=1)
+    return diary_date.isoformat()
+
+
+def get_entry_diary_date(entry: dict[str, Any], diary_day_start: time) -> str | None:
+    if entry.get("diary_date"):
+        return str(entry["diary_date"])
+
+    sent_at = entry.get("message_sent_at")
+    if sent_at:
+        try:
+            return get_diary_date(datetime.fromisoformat(sent_at), diary_day_start)
+        except ValueError:
+            logging.warning("Could not parse message_sent_at for diary date: %s", sent_at)
+
+    message_sent_date = entry.get("message_sent_date")
+    return str(message_sent_date) if message_sent_date else None
 
 
 def read_questions() -> list[str]:
@@ -182,11 +210,13 @@ def build_entry(
     received_at = datetime.now(tzinfo).astimezone(tzinfo)
     message = update.effective_message
     sent_at = message.date.astimezone(tzinfo) if message and message.date else received_at
+    diary_date = get_diary_date(sent_at, settings.diary_day_start)
 
     return {
         "created_at": received_at.isoformat(timespec="seconds"),
         "message_sent_at": sent_at.isoformat(timespec="seconds"),
         "message_sent_date": sent_at.date().isoformat(),
+        "diary_date": diary_date,
         "received_at": received_at.isoformat(timespec="seconds"),
         "received_date": received_at.date().isoformat(),
         "type": entry_type,
@@ -234,10 +264,13 @@ def read_entries_sync() -> list[dict[str, Any]]:
 def format_entry(entry: dict[str, Any], index: int | None = None) -> str:
     sent_at = entry.get("message_sent_at") or entry.get("created_at", "")
     received_at = entry.get("received_at")
+    diary_date = entry.get("diary_date")
     entry_type = entry.get("type", "entry")
     summary = entry.get("summary", "")
     prefix = f"{index}. " if index is not None else ""
     header = f"{prefix}{sent_at} [{entry_type}]"
+    if diary_date and diary_date != entry.get("message_sent_date"):
+        header += f"\nДень дневника: {diary_date}"
     if received_at and received_at != sent_at:
         header += f"\nПолучено ботом: {received_at}"
     return f"{header}\n{summary}".strip()
@@ -317,13 +350,13 @@ def format_daily_checkin_summary(answers: dict[str, Any]) -> str:
     )
 
 
-async def format_previous_daily_checkin(chat_id: int, target_date: str) -> str | None:
+async def format_previous_daily_checkin(chat_id: int, target_date: str, settings: Settings) -> str | None:
     entries = await read_entries()
     checkins = [
         entry
         for entry in entries
         if entry.get("type") == "daily_checkin"
-        and entry.get("message_sent_date") == target_date
+        and get_entry_diary_date(entry, settings.diary_day_start) == target_date
         and (entry.get("chat") or {}).get("id") == chat_id
     ]
     if not checkins:
@@ -347,8 +380,9 @@ async def format_previous_daily_checkin(chat_id: int, target_date: str) -> str |
 async def start_daily_checkin_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     settings: Settings = context.application.bot_data["settings"]
     tzinfo = settings.questions_time.tzinfo
-    yesterday_date = (datetime.now(tzinfo).date() - timedelta(days=1)).isoformat()
-    yesterday_checkin = await format_previous_daily_checkin(chat_id, yesterday_date)
+    current_diary_date = datetime.fromisoformat(get_diary_date(datetime.now(tzinfo), settings.diary_day_start)).date()
+    yesterday_date = (current_diary_date - timedelta(days=1)).isoformat()
+    yesterday_checkin = await format_previous_daily_checkin(chat_id, yesterday_date, settings)
     questions = get_daily_checkin_questions()
     sessions = get_daily_checkin_sessions(context)
     sessions[chat_id] = {
@@ -579,11 +613,11 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     settings: Settings = context.application.bot_data["settings"]
     tzinfo = settings.questions_time.tzinfo
-    today_date = datetime.now(tzinfo).date().isoformat()
+    today_date = get_diary_date(datetime.now(tzinfo), settings.diary_day_start)
     entries = [
         entry
         for entry in await read_entries()
-        if entry.get("message_sent_date") == today_date
+        if get_entry_diary_date(entry, settings.diary_day_start) == today_date
     ]
     if not entries:
         await update.effective_message.reply_text("За сегодня записей пока нет.")
