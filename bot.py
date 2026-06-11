@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -40,6 +41,8 @@ except ImportError:  # GigaChat is optional; the bot still stores raw entries.
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
+EXPORTS_DIR = DATA_DIR / "exports"
+BACKUPS_DIR = DATA_DIR / "backups"
 DIARY_PATH = DATA_DIR / "diary.jsonl"
 QUESTIONS_PATH = BASE_DIR / "questions.json"
 
@@ -191,6 +194,8 @@ def read_questions() -> list[str]:
 def ensure_storage() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     UPLOADS_DIR.mkdir(exist_ok=True)
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    BACKUPS_DIR.mkdir(exist_ok=True)
     if not QUESTIONS_PATH.exists():
         QUESTIONS_PATH.write_text(
             json.dumps({"questions": DEFAULT_QUESTIONS}, ensure_ascii=False, indent=2),
@@ -279,6 +284,35 @@ def read_entries_sync() -> list[dict[str, Any]]:
     return entries
 
 
+async def rewrite_entries_with_backup(entries: list[dict[str, Any]]) -> Path:
+    return await asyncio.to_thread(rewrite_entries_with_backup_sync, entries)
+
+
+def rewrite_entries_with_backup_sync(entries: list[dict[str, Any]]) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = BACKUPS_DIR / f"diary_{timestamp}.jsonl"
+    if DIARY_PATH.exists():
+        shutil.copy2(DIARY_PATH, backup_path)
+    else:
+        backup_path.write_text("", encoding="utf-8")
+
+    lines = [json.dumps(entry, ensure_ascii=False) for entry in entries]
+    DIARY_PATH.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return backup_path
+
+
+def get_entries_for_diary_date(
+    entries: list[dict[str, Any]],
+    diary_date: str,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    return [
+        entry
+        for entry in entries
+        if get_entry_diary_date(entry, settings.diary_day_start) == diary_date
+    ]
+
+
 def format_entry(entry: dict[str, Any], index: int | None = None) -> str:
     sent_at = entry.get("message_sent_at") or entry.get("created_at", "")
     received_at = entry.get("received_at")
@@ -312,6 +346,66 @@ def split_telegram_messages(text: str, limit: int = 3900) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def escape_markdown_text(text: str) -> str:
+    return text.replace("\r\n", "\n").strip()
+
+
+def format_export_entry(entry: dict[str, Any], index: int) -> str:
+    entry_type = entry.get("type", "entry")
+    sent_at = entry.get("message_sent_at") or entry.get("created_at", "")
+    received_at = entry.get("received_at")
+    summary = escape_markdown_text(str(entry.get("summary") or ""))
+
+    lines = [f"### {index}. {entry_type}"]
+    if sent_at:
+        lines.append(f"- Отправлено: {sent_at}")
+    if received_at and received_at != sent_at:
+        lines.append(f"- Получено ботом: {received_at}")
+
+    raw = entry.get("raw") or {}
+    if entry_type == "daily_checkin":
+        answers = raw.get("answers") or {}
+        if answers:
+            did_sport = "да" if answers.get("did_sport") is True else "нет"
+            lines.extend(
+                [
+                    "",
+                    "- Сон: " + str(answers.get("sleep_quality")) + "/10",
+                    "- Уснул: " + str(answers.get("fell_asleep_at")),
+                    "- Боль: " + str(answers.get("pain_level")) + "/10",
+                    "- Спорт: " + did_sport,
+                ]
+            )
+            return "\n".join(lines)
+
+    if summary:
+        lines.extend(["", summary])
+    return "\n".join(lines)
+
+
+def build_markdown_export(entries: list[dict[str, Any]], settings: Settings) -> str:
+    generated_at = datetime.now(settings.questions_time.tzinfo).isoformat(timespec="seconds")
+    lines = [
+        "# Дневник питания и самочувствия",
+        "",
+        f"Экспорт создан: {generated_at}",
+        "",
+    ]
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        diary_date = get_entry_diary_date(entry, settings.diary_day_start) or "без даты"
+        grouped.setdefault(diary_date, []).append(entry)
+
+    for diary_date in sorted(grouped):
+        lines.extend([f"## {diary_date}", ""])
+        for index, entry in enumerate(grouped[diary_date], 1):
+            lines.append(format_export_entry(entry, index))
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
 
 
 def get_daily_checkin_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict[str, Any]]:
@@ -623,9 +717,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - показать список команд\n"
         "/last - показать последнюю запись дневника\n"
         "/today - показать записи за текущий дневниковый день\n"
+        "/day - показать записи за выбранный дневниковый день\n"
+        "/delete_last - удалить последнюю запись текущего чата\n"
         "/checkin - запустить ежедневную проверку самочувствия\n"
-        "/fasting - отметить текущий дневниковый день как разгрузочный\n\n"
-        "Для разгрузочного дня можно указать дату:\n"
+        "/fasting - отметить текущий дневниковый день как разгрузочный\n"
+        "/export - отправить дневник Markdown-файлом\n\n"
+        "Для /day и /fasting можно указать дату:\n"
+        "/day вчера\n"
+        "/day сегодня\n"
+        "/day 2026-06-05\n"
         "/fasting вчера\n"
         "/fasting сегодня\n"
         "/fasting 2026-06-05"
@@ -651,11 +751,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     tzinfo = settings.questions_time.tzinfo
     today_date = get_diary_date(datetime.now(tzinfo), settings.diary_day_start)
-    entries = [
-        entry
-        for entry in await read_entries()
-        if get_entry_diary_date(entry, settings.diary_day_start) == today_date
-    ]
+    entries = get_entries_for_diary_date(await read_entries(), today_date, settings)
     if not entries:
         await update.effective_message.reply_text("За сегодня записей пока нет.")
         return
@@ -665,6 +761,61 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     for chunk in split_telegram_messages(text):
         await update.effective_message.reply_text(chunk)
+
+
+async def day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    argument = " ".join(context.args or [])
+    diary_date, error = parse_diary_date_argument(argument, settings)
+    if error:
+        await update.effective_message.reply_text(error)
+        return
+
+    entries = get_entries_for_diary_date(await read_entries(), diary_date, settings)
+    if not entries:
+        await update.effective_message.reply_text(f"За {diary_date} записей нет.")
+        return
+
+    text = f"Записи за {diary_date}:\n\n" + "\n\n".join(
+        format_entry(entry, index) for index, entry in enumerate(entries, 1)
+    )
+    for chunk in split_telegram_messages(text):
+        await update.effective_message.reply_text(chunk)
+
+
+async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    entries = await read_entries()
+    if not entries:
+        await update.effective_message.reply_text("В дневнике пока нет записей.")
+        return
+
+    delete_index = None
+    for index in range(len(entries) - 1, -1, -1):
+        if (entries[index].get("chat") or {}).get("id") == chat.id:
+            delete_index = index
+            break
+
+    if delete_index is None:
+        await update.effective_message.reply_text("Не нашел записей для этого чата.")
+        return
+
+    deleted_entry = entries.pop(delete_index)
+    backup_path = await rewrite_entries_with_backup(entries)
+    await update.effective_message.reply_text(
+        "Удалил последнюю запись:\n\n"
+        + format_entry(deleted_entry)
+        + f"\n\nРезервная копия: {backup_path}"
+    )
 
 
 async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -702,6 +853,29 @@ async def fasting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     entry["diary_date"] = diary_date
     await save_entry(entry)
     await update.effective_message.reply_text(f"Записал разгрузочный день за {diary_date}.")
+
+
+async def export_diary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    entries = await read_entries()
+    if not entries:
+        await update.effective_message.reply_text("В дневнике пока нет записей для экспорта.")
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    export_text = build_markdown_export(entries, settings)
+    timestamp = datetime.now(settings.questions_time.tzinfo).strftime("%Y%m%d_%H%M%S")
+    export_path = EXPORTS_DIR / f"diary_export_{timestamp}.md"
+    await asyncio.to_thread(export_path.write_text, export_text, "utf-8")
+
+    with export_path.open("rb") as file:
+        await update.effective_message.reply_document(
+            document=file,
+            filename=export_path.name,
+            caption="Экспорт дневника в Markdown.",
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -787,8 +961,11 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("last", last))
     application.add_handler(CommandHandler("today", today))
+    application.add_handler(CommandHandler("day", day))
+    application.add_handler(CommandHandler("delete_last", delete_last))
     application.add_handler(CommandHandler("checkin", checkin))
     application.add_handler(CommandHandler("fasting", fasting))
+    application.add_handler(CommandHandler("export", export_diary))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
