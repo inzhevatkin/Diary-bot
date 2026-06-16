@@ -7,6 +7,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -47,16 +48,16 @@ DIARY_PATH = DATA_DIR / "diary.jsonl"
 QUESTIONS_PATH = BASE_DIR / "questions.json"
 
 DEFAULT_QUESTIONS = [
-    "Какой был сон? Ответ: от 0 до 10 баллов, 10 - очень хороший.",
+    "Какой был сон? Ответ: от 0 до 10 баллов, можно дробное значение, 10 - очень хороший.",
     "Во сколько уснул? Ответ: примерное время.",
-    "Какой уровень болевых ощущений? Ответ: от 0 до 10 баллов, 0 - боли нет совсем, 10 - боль очень сильная.",
+    "Какой уровень болевых ощущений? Ответ: от 0 до 10 баллов, можно дробное значение, 0 - боли нет совсем, 10 - боль очень сильная.",
     "Занимался ли спортом? Ответ: да/нет.",
 ]
 
 DAILY_CHECKIN_QUESTIONS = [
     {
         "key": "sleep_quality",
-        "question": "Какой был сон? Ответьте числом от 0 до 10, где 10 - очень хороший сон.",
+        "question": "Какой был сон? Ответьте числом от 0 до 10, можно дробное значение, где 10 - очень хороший сон.",
     },
     {
         "key": "fell_asleep_at",
@@ -64,7 +65,7 @@ DAILY_CHECKIN_QUESTIONS = [
     },
     {
         "key": "pain_level",
-        "question": "Какой уровень болевых ощущений? Ответьте числом от 0 до 10, где 0 - боли нет совсем, 10 - боль очень сильная.",
+        "question": "Какой уровень болевых ощущений? Ответьте числом от 0 до 10, можно дробное значение, где 0 - боли нет совсем, 10 - боль очень сильная.",
     },
     {
         "key": "did_sport",
@@ -162,12 +163,29 @@ def get_entry_diary_date(entry: dict[str, Any], diary_day_start: time) -> str | 
     return str(message_sent_date) if message_sent_date else None
 
 
+def get_current_diary_date(settings: Settings, moment: datetime | None = None) -> str:
+    tzinfo = settings.questions_time.tzinfo
+    current_moment = moment or datetime.now(tzinfo)
+    return get_diary_date(current_moment, settings.diary_day_start)
+
+
+def get_checkin_scheduled_at(diary_date: str, settings: Settings) -> datetime:
+    scheduled_date = datetime.fromisoformat(diary_date).date()
+    if (
+        settings.questions_time.hour,
+        settings.questions_time.minute,
+    ) < (
+        settings.diary_day_start.hour,
+        settings.diary_day_start.minute,
+    ):
+        scheduled_date += timedelta(days=1)
+
+    return datetime.combine(scheduled_date, settings.questions_time)
+
+
 def parse_diary_date_argument(text: str, settings: Settings) -> tuple[str | None, str | None]:
     normalized = text.strip().lower().replace("ё", "е")
-    tzinfo = settings.questions_time.tzinfo
-    current_diary_date = datetime.fromisoformat(
-        get_diary_date(datetime.now(tzinfo), settings.diary_day_start)
-    ).date()
+    current_diary_date = datetime.fromisoformat(get_current_diary_date(settings)).date()
 
     if not normalized or normalized in {"сегодня", "today"}:
         return current_diary_date.isoformat(), None
@@ -313,6 +331,15 @@ def get_entries_for_diary_date(
     ]
 
 
+def has_daily_checkin(entries: list[dict[str, Any]], chat_id: int, diary_date: str, settings: Settings) -> bool:
+    return any(
+        entry.get("type") == "daily_checkin"
+        and (entry.get("chat") or {}).get("id") == chat_id
+        and get_entry_diary_date(entry, settings.diary_day_start) == diary_date
+        for entry in entries
+    )
+
+
 def format_entry(entry: dict[str, Any], index: int | None = None) -> str:
     sent_at = entry.get("message_sent_at") or entry.get("created_at", "")
     received_at = entry.get("received_at")
@@ -421,11 +448,23 @@ def get_daily_checkin_questions() -> list[dict[str, str]]:
     return questions
 
 
-def parse_score_answer(text: str) -> tuple[int | None, str | None]:
-    match = re.search(r"\b(10|[0-9])\b", text.strip())
+def parse_score_answer(text: str) -> tuple[int | float | None, str | None]:
+    match = re.search(r"(?<![-\d,.])(10(?:[,.]0+)?|[0-9](?:[,.]\d+)?)(?![\d,.])", text.strip())
     if not match:
+        return None, "Ответьте числом от 0 до 10. Можно дробное значение, например 7.5 или 7,5."
+
+    raw_value = match.group(1).replace(",", ".")
+    try:
+        value = Decimal(raw_value)
+    except InvalidOperation:
         return None, "Ответьте числом от 0 до 10."
-    return int(match.group(1)), None
+
+    if value < 0 or value > 10:
+        return None, "Ответ должен быть от 0 до 10."
+
+    if value == value.to_integral_value():
+        return int(value), None
+    return float(value), None
 
 
 def parse_yes_no_answer(text: str) -> tuple[bool | None, str | None]:
@@ -462,6 +501,23 @@ def format_daily_checkin_summary(answers: dict[str, Any]) -> str:
     )
 
 
+def format_daily_checkin_answers(entry: dict[str, Any], title: str) -> str:
+    raw = entry.get("raw") or {}
+    answers = raw.get("answers") or {}
+    if not answers:
+        summary = entry.get("summary")
+        return f"{title}:\n{summary}" if summary else title
+
+    did_sport = "да" if answers.get("did_sport") is True else "нет"
+    return (
+        f"{title}:\n"
+        f"Сон: {answers.get('sleep_quality')}/10\n"
+        f"Уснул: {answers.get('fell_asleep_at')}\n"
+        f"Боль: {answers.get('pain_level')}/10\n"
+        f"Спорт: {did_sport}"
+    )
+
+
 async def format_previous_daily_checkin(chat_id: int, target_date: str, settings: Settings) -> str | None:
     entries = await read_entries()
     checkins = [
@@ -474,27 +530,39 @@ async def format_previous_daily_checkin(chat_id: int, target_date: str, settings
     if not checkins:
         return None
 
-    raw = checkins[-1].get("raw") or {}
-    answers = raw.get("answers") or {}
-    if not answers:
-        return checkins[-1].get("summary")
+    return format_daily_checkin_answers(checkins[-1], f"Ответы за вчера ({target_date})")
 
-    did_sport = "да" if answers.get("did_sport") is True else "нет"
-    return (
-        f"Ответы за вчера ({target_date}):\n"
-        f"Сон: {answers.get('sleep_quality')}/10\n"
-        f"Уснул: {answers.get('fell_asleep_at')}\n"
-        f"Боль: {answers.get('pain_level')}/10\n"
-        f"Спорт: {did_sport}"
-    )
+
+async def format_latest_daily_checkin_before(chat_id: int, before_date: str, settings: Settings) -> str | None:
+    entries = await read_entries()
+    dated_checkins: list[tuple[str, dict[str, Any]]] = []
+    for entry in entries:
+        if entry.get("type") != "daily_checkin":
+            continue
+        if (entry.get("chat") or {}).get("id") != chat_id:
+            continue
+        diary_date = get_entry_diary_date(entry, settings.diary_day_start)
+        if diary_date and diary_date < before_date:
+            dated_checkins.append((diary_date, entry))
+
+    if not dated_checkins:
+        return None
+
+    diary_date, entry = sorted(dated_checkins, key=lambda item: item[0])[-1]
+    return format_daily_checkin_answers(entry, f"Последний предыдущий чек-ин ({diary_date})")
 
 
 async def start_daily_checkin_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     settings: Settings = context.application.bot_data["settings"]
     tzinfo = settings.questions_time.tzinfo
-    current_diary_date = datetime.fromisoformat(get_diary_date(datetime.now(tzinfo), settings.diary_day_start)).date()
+    current_diary_date = datetime.fromisoformat(get_current_diary_date(settings)).date()
     yesterday_date = (current_diary_date - timedelta(days=1)).isoformat()
     yesterday_checkin = await format_previous_daily_checkin(chat_id, yesterday_date, settings)
+    previous_checkin = yesterday_checkin or await format_latest_daily_checkin_before(
+        chat_id,
+        current_diary_date.isoformat(),
+        settings,
+    )
     questions = get_daily_checkin_questions()
     sessions = get_daily_checkin_sessions(context)
     sessions[chat_id] = {
@@ -503,15 +571,21 @@ async def start_daily_checkin_for_chat(context: ContextTypes.DEFAULT_TYPE, chat_
         "questions": questions,
         "prompted_at": datetime.now(tzinfo).isoformat(timespec="seconds"),
     }
-    intro = "Ежедневная проверка самочувствия."
-    if yesterday_checkin:
-        intro += "\n\n" + yesterday_checkin
+
+    if previous_checkin:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=previous_checkin,
+        )
     else:
-        intro += f"\n\nЗа вчера ({yesterday_date}) сохраненного чек-ина не нашел."
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"За вчера ({yesterday_date}) сохраненного чек-ина не нашел.",
+        )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=intro + "\n\nСегодня:\n" + questions[0]["question"],
+        text="Ежедневная проверка самочувствия.\n\nСегодня:\n" + questions[0]["question"],
     )
 
 
@@ -749,8 +823,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     settings: Settings = context.application.bot_data["settings"]
-    tzinfo = settings.questions_time.tzinfo
-    today_date = get_diary_date(datetime.now(tzinfo), settings.diary_day_start)
+    today_date = get_current_diary_date(settings)
     entries = get_entries_for_diary_date(await read_entries(), today_date, settings)
     if not entries:
         await update.effective_message.reply_text("За сегодня записей пока нет.")
@@ -941,7 +1014,43 @@ async def send_daily_questions(context: ContextTypes.DEFAULT_TYPE) -> None:
         logging.warning("Daily questions need ALLOWED_CHAT_IDS, otherwise the bot does not know where to send them.")
         return
 
+    diary_date = get_current_diary_date(settings)
+    entries = await read_entries()
+    sessions = get_daily_checkin_sessions(context)
     for chat_id in settings.allowed_chat_ids:
+        if chat_id in sessions:
+            logging.info("Daily check-in is already active for chat %s.", chat_id)
+            continue
+        if has_daily_checkin(entries, chat_id, diary_date, settings):
+            logging.info("Daily check-in for %s already exists in chat %s.", diary_date, chat_id)
+            continue
+        await start_daily_checkin_for_chat(context, chat_id)
+
+
+async def send_missed_daily_questions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not settings.allowed_chat_ids:
+        logging.warning("Missed daily check-in needs ALLOWED_CHAT_IDS, otherwise the bot does not know where to send it.")
+        return
+
+    now = datetime.now(settings.questions_time.tzinfo)
+    diary_date = get_current_diary_date(settings, now)
+    scheduled_at = get_checkin_scheduled_at(diary_date, settings)
+    if now < scheduled_at:
+        logging.info("Daily check-in time has not arrived yet: %s.", scheduled_at.isoformat(timespec="seconds"))
+        return
+
+    entries = await read_entries()
+    sessions = get_daily_checkin_sessions(context)
+    for chat_id in settings.allowed_chat_ids:
+        if chat_id in sessions:
+            logging.info("Missed daily check-in is already active for chat %s.", chat_id)
+            continue
+        if has_daily_checkin(entries, chat_id, diary_date, settings):
+            logging.info("Missed daily check-in for %s is not needed in chat %s.", diary_date, chat_id)
+            continue
+
+        logging.info("Starting missed daily check-in for %s in chat %s.", diary_date, chat_id)
         await start_daily_checkin_for_chat(context, chat_id)
 
 
@@ -971,6 +1080,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     application.job_queue.run_daily(send_daily_questions, settings.questions_time, name="daily_questions")
+    application.job_queue.run_once(send_missed_daily_questions, when=5, name="missed_daily_questions")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
