@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from collections import defaultdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +10,7 @@ from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DIARY_PATH = BASE_DIR / "data" / "diary.jsonl"
+HEALTH_CONNECT_PATH = BASE_DIR / "data" / "imports" / "health_connect.json"
 
 
 def read_entries() -> list[dict]:
@@ -26,6 +28,79 @@ def read_entries() -> list[dict]:
             except json.JSONDecodeError:
                 continue
     return entries
+
+
+def read_health_metrics() -> list[dict]:
+    if not HEALTH_CONNECT_PATH.exists():
+        return []
+
+    try:
+        with HEALTH_CONNECT_PATH.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = payload.get("records") or payload.get("days") or payload.get("data") or []
+    else:
+        records = []
+
+    return [record for record in records if isinstance(record, dict)]
+
+
+def first_present(record: dict, *keys: str):
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def number_or_none(value):
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def normalize_date(value) -> str | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if re_match := re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        return re_match.group(0)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
+
+
+def normalize_health_metric(record: dict) -> dict | None:
+    date = normalize_date(first_present(record, "date", "day", "diary_date", "start_date"))
+    if not date:
+        return None
+
+    return {
+        "date": date,
+        "steps": number_or_none(first_present(record, "steps", "step_count", "steps_count")),
+        "sleep_minutes": number_or_none(
+            first_present(record, "sleep_minutes", "sleep_duration_minutes", "sleep")
+        ),
+        "resting_heart_rate": number_or_none(
+            first_present(record, "resting_heart_rate", "resting_hr", "rhr")
+        ),
+        "average_heart_rate": number_or_none(
+            first_present(record, "average_heart_rate", "avg_heart_rate", "heart_rate_avg")
+        ),
+        "active_minutes": number_or_none(first_present(record, "active_minutes", "activity_minutes")),
+        "calories": number_or_none(first_present(record, "calories", "kilocalories", "energy_kcal")),
+        "source": str(first_present(record, "source", "app", "origin") or "Health Connect"),
+    }
 
 
 def entry_diary_date(entry: dict) -> str:
@@ -72,13 +147,22 @@ def normalize_entry(entry: dict) -> dict:
 def build_payload() -> dict:
     entries = [normalize_entry(entry) for entry in read_entries()]
     entries.sort(key=lambda item: (item["diary_date"], item["message_sent_at"]))
+    health_metrics = [
+        metric
+        for metric in (normalize_health_metric(record) for record in read_health_metrics())
+        if metric is not None
+    ]
+    health_metrics.sort(key=lambda item: item["date"])
+    health_dates = {metric["date"] for metric in health_metrics}
 
     days: dict[str, list[dict]] = defaultdict(list)
     for entry in entries:
         days[entry["diary_date"]].append(entry)
 
     day_summaries = []
-    for diary_date, day_entries in sorted(days.items(), reverse=True):
+    all_dates = set(days) | health_dates
+    for diary_date in sorted(all_dates, reverse=True):
+        day_entries = days.get(diary_date, [])
         checkins = [entry for entry in day_entries if entry["type"] == "daily_checkin"]
         fasting = any(entry["type"] == "fasting_day" for entry in day_entries)
         pain_values = [
@@ -92,6 +176,7 @@ def build_payload() -> dict:
                 "count": len(day_entries),
                 "has_checkin": bool(checkins),
                 "fasting": fasting,
+                "has_health": diary_date in health_dates,
                 "pain": pain_values[-1] if pain_values else None,
             }
         )
@@ -99,8 +184,10 @@ def build_payload() -> dict:
     return {
         "entries": entries,
         "days": day_summaries,
+        "health_metrics": health_metrics,
         "total_entries": len(entries),
-        "total_days": len(days),
+        "total_days": len(all_dates),
+        "total_health_days": len(health_metrics),
     }
 
 
@@ -394,6 +481,48 @@ def page_html() -> str:
       color: #18703b;
       font-weight: 700;
     }
+    .trigger-row {
+      cursor: pointer;
+    }
+    .trigger-row:hover td {
+      background: #fbfcfe;
+    }
+    .trigger-row.active td {
+      background: var(--accent-soft);
+    }
+    .trigger-details {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      margin-top: 12px;
+      padding: 14px;
+      background: #fbfcfe;
+    }
+    .trigger-details h3 {
+      margin: 0 0 10px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+    .trigger-detail-list {
+      display: grid;
+      gap: 10px;
+    }
+    .trigger-detail {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      padding: 10px;
+    }
+    .trigger-detail-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .trigger-snippet {
+      white-space: pre-wrap;
+      line-height: 1.4;
+      color: #344054;
+    }
     @media (max-width: 820px) {
       .layout { grid-template-columns: 1fr; }
       aside {
@@ -416,6 +545,7 @@ def page_html() -> str:
       <div class="stats">
         <div class="stat"><strong id="totalDays">0</strong><span class="muted">дней</span></div>
         <div class="stat"><strong id="totalEntries">0</strong><span class="muted">записей</span></div>
+        <div class="stat"><strong id="totalHealthDays">0</strong><span class="muted">дней браслета</span></div>
       </div>
       <div class="controls">
         <input id="search" type="search" placeholder="Поиск по дневнику">
@@ -443,8 +573,13 @@ def page_html() -> str:
           <div class="table-wrap" id="checkinTable"></div>
         </div>
         <div class="panel">
+          <h2>Данные браслета</h2>
+          <div class="table-wrap" id="healthTable"></div>
+        </div>
+        <div class="panel">
           <h2>Возможные триггеры</h2>
           <div class="table-wrap" id="triggerTable"></div>
+          <div id="triggerDetails"></div>
           <div class="note">Это не медицинский вывод, а поиск совпадений в дневнике. Сильные сигналы стоит проверять отдельно и обсуждать с врачом.</div>
         </div>
       </section>
@@ -461,18 +596,22 @@ def page_html() -> str:
     };
     let payload = { entries: [], days: [] };
     let selectedDay = "all";
+    let selectedTrigger = null;
 
     const els = {
       updated: document.querySelector("#updated"),
       totalDays: document.querySelector("#totalDays"),
       totalEntries: document.querySelector("#totalEntries"),
+      totalHealthDays: document.querySelector("#totalHealthDays"),
       search: document.querySelector("#search"),
       typeFilter: document.querySelector("#typeFilter"),
       allDays: document.querySelector("#allDays"),
       dayList: document.querySelector("#dayList"),
       painChart: document.querySelector("#painChart"),
       checkinTable: document.querySelector("#checkinTable"),
+      healthTable: document.querySelector("#healthTable"),
       triggerTable: document.querySelector("#triggerTable"),
+      triggerDetails: document.querySelector("#triggerDetails"),
       content: document.querySelector("#content")
     };
 
@@ -537,12 +676,30 @@ def page_html() -> str:
       return [entry.summary, entry.raw_text].join(" ").toLowerCase();
     }
 
+    function exposureDisplayText(entry) {
+      return entry.summary || entry.raw_text || "Без текста";
+    }
+
+    function groupMatchesEntry(group, entry) {
+      const text = exposureText(entry);
+      return Boolean(text) && group.keywords.some(keyword => text.includes(keyword));
+    }
+
+    function painMap() {
+      const map = new Map();
+      payload.entries
+        .filter(entry => entry.type === "daily_checkin" && Number.isFinite(Number(entry.pain_level)))
+        .forEach(entry => map.set(entry.diary_date, Number(entry.pain_level)));
+      return map;
+    }
+
     function renderDayList() {
       els.allDays.classList.toggle("active", selectedDay === "all");
       els.dayList.innerHTML = payload.days.map(day => {
         const badges = [
           day.has_checkin ? '<span class="badge checkin">чек-ин</span>' : "",
           day.fasting ? '<span class="badge fasting">разгрузка</span>' : "",
+          day.has_health ? '<span class="badge">браслет</span>' : "",
           day.pain !== null ? `<span class="badge pain">боль ${escapeHtml(day.pain)}/10</span>` : "",
           `<span class="badge">${escapeHtml(day.count)}</span>`
         ].join("");
@@ -685,12 +842,59 @@ def page_html() -> str:
       `;
     }
 
-    function analyzeTriggers() {
-      const painByDate = new Map();
-      payload.entries
-        .filter(entry => entry.type === "daily_checkin" && Number.isFinite(Number(entry.pain_level)))
-        .forEach(entry => painByDate.set(entry.diary_date, Number(entry.pain_level)));
+    function formatMinutes(value) {
+      if (value === null || value === undefined) return "нет";
+      const minutes = Number(value);
+      if (!Number.isFinite(minutes)) return escapeHtml(value);
+      const hours = Math.floor(minutes / 60);
+      const rest = Math.round(minutes % 60);
+      if (!hours) return `${rest} мин`;
+      return `${hours} ч ${String(rest).padStart(2, "0")} мин`;
+    }
 
+    function renderHealthTable() {
+      const metrics = [...(payload.health_metrics || [])].sort((a, b) => b.date.localeCompare(a.date));
+      if (!metrics.length) {
+        els.healthTable.innerHTML = '<div class="chart-empty">Файл data/imports/health_connect.json пока не найден или пуст.</div>';
+        return;
+      }
+
+      const days = dayMap();
+      const rows = metrics.map(metric => {
+        const day = days.get(metric.date) || {};
+        return `
+          <tr>
+            <td>${escapeHtml(metric.date)}</td>
+            <td>${metric.steps ?? '<span class="muted">нет</span>'}</td>
+            <td>${formatMinutes(metric.sleep_minutes)}</td>
+            <td>${metric.resting_heart_rate ?? '<span class="muted">нет</span>'}</td>
+            <td>${metric.average_heart_rate ?? '<span class="muted">нет</span>'}</td>
+            <td>${metric.active_minutes ?? '<span class="muted">нет</span>'}</td>
+            <td>${day.pain !== null && day.pain !== undefined ? `<span class="badge pain">${escapeHtml(day.pain)}/10</span>` : '<span class="muted">нет</span>'}</td>
+          </tr>
+        `;
+      }).join("");
+
+      els.healthTable.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Дата</th>
+              <th>Шаги</th>
+              <th>Сон</th>
+              <th>Пульс покоя</th>
+              <th>Средний пульс</th>
+              <th>Активные мин.</th>
+              <th>Боль</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      `;
+    }
+
+    function analyzeTriggers() {
+      const painByDate = painMap();
       const allPainDates = [...painByDate.keys()].sort();
       if (allPainDates.length < 4) return [];
 
@@ -738,6 +942,7 @@ def page_html() -> str:
 
         return {
           name: group.name,
+          keywords: group.keywords,
           occurrences: exposureDates.length,
           best,
           hasData: usable.length > 0
@@ -756,6 +961,7 @@ def page_html() -> str:
       const results = analyzeTriggers();
       if (!results.length) {
         els.triggerTable.innerHTML = '<div class="chart-empty">Пока мало данных для поиска триггеров.</div>';
+        els.triggerDetails.innerHTML = "";
         return;
       }
 
@@ -772,7 +978,7 @@ def page_html() -> str:
               ? '<span class="badge fasting">ниже</span>'
               : '<span class="badge">слабый сигнал</span>';
         return `
-          <tr>
+          <tr class="trigger-row ${selectedTrigger === result.name ? "active" : ""}" data-trigger="${escapeHtml(result.name)}">
             <td><strong>${escapeHtml(result.name)}</strong></td>
             <td>${escapeHtml(result.occurrences)}</td>
             <td>${escapeHtml(lagText)}</td>
@@ -799,6 +1005,76 @@ def page_html() -> str:
           </thead>
           <tbody>${rows}</tbody>
         </table>
+      `;
+      document.querySelectorAll("[data-trigger]").forEach(row => {
+        row.addEventListener("click", () => {
+          selectedTrigger = selectedTrigger === row.dataset.trigger ? null : row.dataset.trigger;
+          renderTriggerTable();
+        });
+      });
+      renderTriggerDetails(results);
+    }
+
+    function triggerDetailItems(groupName) {
+      const group = triggerGroups.find(item => item.name === groupName);
+      if (!group) return [];
+      const painByDate = painMap();
+      const entries = payload.entries
+        .filter(entry => groupMatchesEntry(group, entry))
+        .sort((a, b) => (b.diary_date + b.message_sent_at).localeCompare(a.diary_date + a.message_sent_at));
+
+      return entries.map(entry => ({
+        entry,
+        pain0: painByDate.get(entry.diary_date),
+        pain1: painByDate.get(addDays(entry.diary_date, 1)),
+        pain2: painByDate.get(addDays(entry.diary_date, 2))
+      }));
+    }
+
+    function painBadge(label, value) {
+      return value === undefined
+        ? `<span class="badge">${label}: нет</span>`
+        : `<span class="badge pain">${label}: ${escapeHtml(value)}/10</span>`;
+    }
+
+    function renderTriggerDetails(results) {
+      if (!selectedTrigger) {
+        els.triggerDetails.innerHTML = "";
+        return;
+      }
+
+      const result = results.find(item => item.name === selectedTrigger);
+      const items = triggerDetailItems(selectedTrigger);
+      if (!result || !items.length) {
+        els.triggerDetails.innerHTML = "";
+        return;
+      }
+
+      const best = result.best;
+      const lagText = best.lag === 0 ? "тот же день" : `+${best.lag} дн.`;
+      const rows = items.map(item => {
+        const entry = item.entry;
+        return `
+          <div class="trigger-detail">
+            <div class="trigger-detail-head">
+              <div><strong>${escapeHtml(entry.diary_date)}</strong> <span class="muted">${escapeHtml(entry.time)}</span></div>
+              <div class="badge-row">
+                ${painBadge("0", item.pain0)}
+                ${painBadge("+1", item.pain1)}
+                ${painBadge("+2", item.pain2)}
+              </div>
+            </div>
+            <div class="trigger-snippet">${escapeHtml(exposureDisplayText(entry))}</div>
+          </div>
+        `;
+      }).join("");
+
+      els.triggerDetails.innerHTML = `
+        <div class="trigger-details">
+          <h3>${escapeHtml(selectedTrigger)}</h3>
+          <div class="note">Лучший лаг в расчёте: ${escapeHtml(lagText)}. Найденные ключи: ${escapeHtml(result.keywords.join(", "))}.</div>
+          <div class="trigger-detail-list">${rows}</div>
+        </div>
       `;
     }
 
@@ -849,6 +1125,7 @@ def page_html() -> str:
     function render() {
       renderPainChart();
       renderCheckinTable();
+      renderHealthTable();
       renderTriggerTable();
       renderDayList();
       renderContent();
@@ -859,6 +1136,7 @@ def page_html() -> str:
       payload = await response.json();
       els.totalDays.textContent = payload.total_days;
       els.totalEntries.textContent = payload.total_entries;
+      els.totalHealthDays.textContent = payload.total_health_days || 0;
       els.updated.textContent = "Обновлено: " + new Date().toLocaleString("ru-RU");
       render();
     }
