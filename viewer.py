@@ -7,27 +7,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from storage import initialize_storage
+from storage import read_entries as storage_read_entries
+
 
 BASE_DIR = Path(__file__).resolve().parent
-DIARY_PATH = BASE_DIR / "data" / "diary.jsonl"
 HEALTH_CONNECT_PATH = BASE_DIR / "data" / "imports" / "health_connect.json"
+VIEWER_CHAT_ID: int | None = None
 
 
 def read_entries() -> list[dict]:
-    if not DIARY_PATH.exists():
-        return []
-
-    entries = []
-    with DIARY_PATH.open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return entries
+    return storage_read_entries(VIEWER_CHAT_ID)
 
 
 def read_health_metrics() -> list[dict]:
@@ -128,6 +118,8 @@ def normalize_entry(entry: dict) -> dict:
     summary = str(entry.get("summary") or "")
     raw = entry.get("raw") or {}
     answers = checkin_answers(entry)
+    chat = entry.get("chat") if isinstance(entry.get("chat"), dict) else {}
+    user = entry.get("user") if isinstance(entry.get("user"), dict) else {}
     return {
         "type": entry_type,
         "diary_date": entry_diary_date(entry),
@@ -141,6 +133,11 @@ def normalize_entry(entry: dict) -> dict:
         "sleep_quality": answers.get("sleep_quality"),
         "fell_asleep_at": answers.get("fell_asleep_at"),
         "did_sport": answers.get("did_sport"),
+        "chat_id": chat.get("id"),
+        "chat_title": chat.get("title"),
+        "user_id": user.get("id"),
+        "username": user.get("username"),
+        "user_name": user.get("name"),
     }
 
 
@@ -185,6 +182,7 @@ def build_payload() -> dict:
         "entries": entries,
         "days": day_summaries,
         "health_metrics": health_metrics,
+        "chat_id": VIEWER_CHAT_ID,
         "total_entries": len(entries),
         "total_days": len(all_dates),
         "total_health_days": len(health_metrics),
@@ -1181,14 +1179,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local browser viewer for the Telegram diary.")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind. Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind. Default: 8000")
+    parser.add_argument("--chat-id", type=int, help="Show entries for one Telegram chat only.")
     return parser.parse_args()
 
 
 def main() -> None:
+    global VIEWER_CHAT_ID
     args = parse_args()
+    VIEWER_CHAT_ID = args.chat_id
+    initialize_storage()
     server = ThreadingHTTPServer((args.host, args.port), DiaryViewerHandler)
     url = f"http://{args.host}:{args.port}"
     print(f"Diary viewer is running at {url}")
+    if VIEWER_CHAT_ID is not None:
+        print(f"Showing Telegram chat only: {VIEWER_CHAT_ID}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

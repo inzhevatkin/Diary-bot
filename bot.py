@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -21,6 +20,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from storage import initialize_storage
+from storage import append_entry as storage_append_entry
+from storage import read_entries as storage_read_entries
+from storage import rewrite_entries_with_backup as storage_rewrite_entries_with_backup
 
 try:
     from openai import APIError as OpenAIAPIError
@@ -44,7 +48,6 @@ DATA_DIR = BASE_DIR / "data"
 UPLOADS_DIR = DATA_DIR / "uploads"
 EXPORTS_DIR = DATA_DIR / "exports"
 BACKUPS_DIR = DATA_DIR / "backups"
-DIARY_PATH = DATA_DIR / "diary.jsonl"
 QUESTIONS_PATH = BASE_DIR / "questions.json"
 
 DEFAULT_QUESTIONS = [
@@ -210,7 +213,7 @@ def read_questions() -> list[str]:
 
 
 def ensure_storage() -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+    initialize_storage()
     UPLOADS_DIR.mkdir(exist_ok=True)
     EXPORTS_DIR.mkdir(exist_ok=True)
     BACKUPS_DIR.mkdir(exist_ok=True)
@@ -273,50 +276,15 @@ def build_entry(
 
 
 async def save_entry(entry: dict[str, Any]) -> None:
-    line = json.dumps(entry, ensure_ascii=False)
-    await asyncio.to_thread(append_line, DIARY_PATH, line)
+    await asyncio.to_thread(storage_append_entry, entry)
 
 
-def append_line(path: Path, line: str) -> None:
-    with path.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
-
-
-async def read_entries() -> list[dict[str, Any]]:
-    if not DIARY_PATH.exists():
-        return []
-    return await asyncio.to_thread(read_entries_sync)
-
-
-def read_entries_sync() -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    with DIARY_PATH.open("r", encoding="utf-8") as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                logging.warning("Skipping invalid diary line: %s", line[:120])
-    return entries
+async def read_entries(chat_id: int | None = None) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(storage_read_entries, chat_id)
 
 
 async def rewrite_entries_with_backup(entries: list[dict[str, Any]]) -> Path:
-    return await asyncio.to_thread(rewrite_entries_with_backup_sync, entries)
-
-
-def rewrite_entries_with_backup_sync(entries: list[dict[str, Any]]) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = BACKUPS_DIR / f"diary_{timestamp}.jsonl"
-    if DIARY_PATH.exists():
-        shutil.copy2(DIARY_PATH, backup_path)
-    else:
-        backup_path.write_text("", encoding="utf-8")
-
-    lines = [json.dumps(entry, ensure_ascii=False) for entry in entries]
-    DIARY_PATH.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    return backup_path
+    return await asyncio.to_thread(storage_rewrite_entries_with_backup, entries)
 
 
 def get_entries_for_diary_date(
@@ -439,6 +407,10 @@ def get_daily_checkin_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict[int, 
     return context.application.bot_data.setdefault("daily_checkins", {})
 
 
+def get_pending_entry_sessions(context: ContextTypes.DEFAULT_TYPE) -> dict[int, dict[str, Any]]:
+    return context.application.bot_data.setdefault("pending_entries", {})
+
+
 def get_daily_checkin_questions() -> list[dict[str, str]]:
     questions = [dict(question) for question in DAILY_CHECKIN_QUESTIONS]
     configured_questions = read_questions()
@@ -519,7 +491,7 @@ def format_daily_checkin_answers(entry: dict[str, Any], title: str) -> str:
 
 
 async def format_previous_daily_checkin(chat_id: int, target_date: str, settings: Settings) -> str | None:
-    entries = await read_entries()
+    entries = await read_entries(chat_id)
     checkins = [
         entry
         for entry in entries
@@ -534,7 +506,7 @@ async def format_previous_daily_checkin(chat_id: int, target_date: str, settings
 
 
 async def format_latest_daily_checkin_before(chat_id: int, before_date: str, settings: Settings) -> str | None:
-    entries = await read_entries()
+    entries = await read_entries(chat_id)
     dated_checkins: list[tuple[str, dict[str, Any]]] = []
     for entry in entries:
         if entry.get("type") != "daily_checkin":
@@ -792,14 +764,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/last - показать последнюю запись дневника\n"
         "/today - показать записи за текущий дневниковый день\n"
         "/day - показать записи за выбранный дневниковый день\n"
+        "/add - следующую текстовую запись сохранить за выбранную дату\n"
+        "/cancel - отменить активный режим ввода\n"
         "/delete_last - удалить последнюю запись текущего чата\n"
         "/checkin - запустить ежедневную проверку самочувствия\n"
         "/fasting - отметить текущий дневниковый день как разгрузочный\n"
         "/export - отправить дневник Markdown-файлом\n\n"
-        "Для /day и /fasting можно указать дату:\n"
+        "Для /day, /add и /fasting можно указать дату:\n"
         "/day вчера\n"
         "/day сегодня\n"
         "/day 2026-06-05\n"
+        "/add вчера\n"
+        "/add сегодня\n"
+        "/add 2026-06-05\n"
         "/fasting вчера\n"
         "/fasting сегодня\n"
         "/fasting 2026-06-05"
@@ -810,7 +787,8 @@ async def last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_allowed(update, context):
         return
 
-    entries = await read_entries()
+    chat = update.effective_chat
+    entries = await read_entries(chat.id if chat else None)
     if not entries:
         await update.effective_message.reply_text("В дневнике пока нет записей.")
         return
@@ -824,7 +802,8 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     settings: Settings = context.application.bot_data["settings"]
     today_date = get_current_diary_date(settings)
-    entries = get_entries_for_diary_date(await read_entries(), today_date, settings)
+    chat = update.effective_chat
+    entries = get_entries_for_diary_date(await read_entries(chat.id if chat else None), today_date, settings)
     if not entries:
         await update.effective_message.reply_text("За сегодня записей пока нет.")
         return
@@ -847,7 +826,8 @@ async def day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(error)
         return
 
-    entries = get_entries_for_diary_date(await read_entries(), diary_date, settings)
+    chat = update.effective_chat
+    entries = get_entries_for_diary_date(await read_entries(chat.id if chat else None), diary_date, settings)
     if not entries:
         await update.effective_message.reply_text(f"За {diary_date} записей нет.")
         return
@@ -891,12 +871,77 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def add_for_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    if chat.id in get_daily_checkin_sessions(context):
+        await update.effective_message.reply_text(
+            "Сейчас идет чек-ин. Завершите его или отправьте /cancel, потом запустите /add еще раз."
+        )
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    argument = " ".join(context.args or [])
+    if not argument.strip():
+        await update.effective_message.reply_text(
+            "Укажите дату: /add вчера, /add сегодня или /add 2026-06-05."
+        )
+        return
+
+    diary_date, error = parse_diary_date_argument(argument, settings)
+    if error:
+        await update.effective_message.reply_text(error)
+        return
+
+    sessions = get_pending_entry_sessions(context)
+    sessions[chat.id] = {
+        "diary_date": diary_date,
+        "command_argument": argument,
+        "started_at": datetime.now(settings.questions_time.tzinfo).isoformat(timespec="seconds"),
+    }
+    await update.effective_message.reply_text(
+        f"Ок, следующую текстовую запись сохраню за {diary_date}.\n"
+        "Пришлите текст питания или самочувствия. Чтобы отменить, отправьте /cancel."
+    )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_allowed(update, context):
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    cancelled = []
+    if get_pending_entry_sessions(context).pop(chat.id, None):
+        cancelled.append("запись за выбранную дату")
+    if get_daily_checkin_sessions(context).pop(chat.id, None):
+        cancelled.append("чек-ин")
+
+    if not cancelled:
+        await update.effective_message.reply_text("Сейчас нет активного режима ввода.")
+        return
+
+    await update.effective_message.reply_text("Отменил: " + ", ".join(cancelled) + ".")
+
+
 async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_allowed(update, context):
         return
 
     chat = update.effective_chat
     if not chat:
+        return
+    if chat.id in get_pending_entry_sessions(context):
+        await update.effective_message.reply_text(
+            "Сначала пришлите текст для записи за выбранную дату или отмените режим командой /cancel."
+        )
         return
     await start_daily_checkin_for_chat(context, chat.id)
 
@@ -932,7 +977,8 @@ async def export_diary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await require_allowed(update, context):
         return
 
-    entries = await read_entries()
+    chat = update.effective_chat
+    entries = await read_entries(chat.id if chat else None)
     if not entries:
         await update.effective_message.reply_text("В дневнике пока нет записей для экспорта.")
         return
@@ -951,11 +997,47 @@ async def export_diary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def handle_pending_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    message = update.effective_message
+    if not chat or not message:
+        return False
+
+    sessions = get_pending_entry_sessions(context)
+    session = sessions.get(chat.id)
+    if not session:
+        return False
+
+    settings: Settings = context.application.bot_data["settings"]
+    text = message.text or ""
+    summary = await summarize_text(text, settings)
+    entry = build_entry(
+        update,
+        settings,
+        "text",
+        summary,
+        {
+            "text": text,
+            "marked_diary_date": session["diary_date"],
+            "command_argument": session.get("command_argument", ""),
+            "pending_started_at": session.get("started_at"),
+        },
+    )
+    entry["diary_date"] = session["diary_date"]
+    await save_entry(entry)
+    sessions.pop(chat.id, None)
+    await message.reply_text(f"Записал за {entry['diary_date']}:\n" + summary)
+    return True
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_allowed(update, context):
         return
 
     if await handle_daily_checkin_answer(update, context):
+        return
+
+    if await handle_pending_entry(update, context):
         return
 
     settings: Settings = context.application.bot_data["settings"]
@@ -1017,7 +1099,11 @@ async def send_daily_questions(context: ContextTypes.DEFAULT_TYPE) -> None:
     diary_date = get_current_diary_date(settings)
     entries = await read_entries()
     sessions = get_daily_checkin_sessions(context)
+    pending_entries = get_pending_entry_sessions(context)
     for chat_id in settings.allowed_chat_ids:
+        if chat_id in pending_entries:
+            logging.info("Daily check-in is skipped because dated entry mode is active for chat %s.", chat_id)
+            continue
         if chat_id in sessions:
             logging.info("Daily check-in is already active for chat %s.", chat_id)
             continue
@@ -1042,7 +1128,11 @@ async def send_missed_daily_questions(context: ContextTypes.DEFAULT_TYPE) -> Non
 
     entries = await read_entries()
     sessions = get_daily_checkin_sessions(context)
+    pending_entries = get_pending_entry_sessions(context)
     for chat_id in settings.allowed_chat_ids:
+        if chat_id in pending_entries:
+            logging.info("Missed daily check-in is skipped because dated entry mode is active for chat %s.", chat_id)
+            continue
         if chat_id in sessions:
             logging.info("Missed daily check-in is already active for chat %s.", chat_id)
             continue
@@ -1071,6 +1161,8 @@ def main() -> None:
     application.add_handler(CommandHandler("last", last))
     application.add_handler(CommandHandler("today", today))
     application.add_handler(CommandHandler("day", day))
+    application.add_handler(CommandHandler("add", add_for_date))
+    application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("delete_last", delete_last))
     application.add_handler(CommandHandler("checkin", checkin))
     application.add_handler(CommandHandler("fasting", fasting))
