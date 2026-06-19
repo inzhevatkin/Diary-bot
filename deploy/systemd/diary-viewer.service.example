@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Diary Viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/diary-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/diary-bot/.venv/bin/python /opt/diary-bot/viewer.py --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

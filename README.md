@@ -182,3 +182,38 @@ python viewer.py --chat-id 123456789
 ```powershell
 python storage.py
 ```
+
+## Автозапуск на сервере
+
+Для Linux-сервера с проектом в `/opt/diary-bot` подготовлены systemd-шаблоны:
+
+```text
+deploy/systemd/diary-bot.service.example
+deploy/systemd/diary-viewer.service.example
+```
+
+Установить службы на сервере:
+
+```bash
+sudo cp /opt/diary-bot/deploy/systemd/diary-bot.service.example /etc/systemd/system/diary-bot.service
+sudo cp /opt/diary-bot/deploy/systemd/diary-viewer.service.example /etc/systemd/system/diary-viewer.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now diary-bot
+sudo systemctl enable --now diary-viewer
+```
+
+Проверить статус:
+
+```bash
+sudo systemctl status diary-bot
+sudo systemctl status diary-viewer
+```
+
+Посмотреть логи:
+
+```bash
+sudo journalctl -u diary-bot -f
+sudo journalctl -u diary-viewer -f
+```
+
+По умолчанию viewer слушает только `127.0.0.1:8000`, чтобы дневник не был случайно открыт в интернет без защиты.
