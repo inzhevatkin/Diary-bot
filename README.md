@@ -217,3 +217,62 @@ sudo journalctl -u diary-viewer -f
 ```
 
 По умолчанию viewer слушает только `127.0.0.1:8000`, чтобы дневник не был случайно открыт в интернет без защиты.
+
+## Публичный доступ к viewer через nginx
+
+Перед настройкой нужен домен или поддомен, A-запись которого указывает на IP сервера. В примерах ниже замените `diary.example.com` на свой домен.
+На сервере или в панели VPS должны быть открыты входящие порты `80` и `443`.
+
+Установить nginx, Basic Auth и Certbot:
+
+```bash
+sudo apt update
+sudo apt install -y nginx apache2-utils certbot python3-certbot-nginx
+```
+
+Создать пароль для сайта:
+
+```bash
+sudo htpasswd -c /etc/nginx/.htpasswd-diary diary
+```
+
+Скопировать конфиг nginx и заменить домен:
+
+```bash
+sudo cp /opt/diary-bot/deploy/nginx/diary-viewer.conf.example /etc/nginx/sites-available/diary-viewer
+sudo nano /etc/nginx/sites-available/diary-viewer
+```
+
+В файле нужно заменить:
+
+```text
+server_name diary.example.com;
+```
+
+на свой домен, например:
+
+```text
+server_name diary.my-domain.com;
+```
+
+Включить сайт:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/diary-viewer /etc/nginx/sites-enabled/diary-viewer
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Получить HTTPS-сертификат:
+
+```bash
+sudo certbot --nginx -d diary.example.com
+```
+
+После этого viewer будет доступен по адресу:
+
+```text
+https://diary.example.com
+```
+
+Viewer при этом продолжает слушать только `127.0.0.1:8000`, а наружу выходит nginx с паролем и HTTPS.
