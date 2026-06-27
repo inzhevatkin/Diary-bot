@@ -1,0 +1,8 @@
+[Unit]
+Description=Telegram Diary SQLite Backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/diary-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/diary-bot/.venv/bin/python /opt/diary-bot/backup.py --keep 14

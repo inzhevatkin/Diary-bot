@@ -276,3 +276,53 @@ https://diary.example.com
 ```
 
 Viewer при этом продолжает слушать только `127.0.0.1:8000`, а наружу выходит nginx с паролем и HTTPS.
+
+## Резервные копии
+
+SQLite-базу дневника можно сохранить вручную:
+
+```bash
+cd /opt/diary-bot
+source .venv/bin/activate
+python backup.py
+```
+
+По умолчанию копии создаются в:
+
+```text
+data/backups/sqlite/
+```
+
+Скрипт хранит последние 14 копий и проверяет каждую новую копию через `PRAGMA integrity_check`.
+
+Для ежедневного backup на сервере установите systemd timer:
+
+```bash
+sudo cp /opt/diary-bot/deploy/systemd/diary-backup.service.example /etc/systemd/system/diary-backup.service
+sudo cp /opt/diary-bot/deploy/systemd/diary-backup.timer.example /etc/systemd/system/diary-backup.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now diary-backup.timer
+```
+
+Проверить timer:
+
+```bash
+sudo systemctl status diary-backup.timer
+systemctl list-timers diary-backup.timer
+```
+
+Запустить backup сразу:
+
+```bash
+sudo systemctl start diary-backup.service
+sudo journalctl -u diary-backup.service -n 50
+```
+
+Восстановление из копии делайте только при остановленных службах:
+
+```bash
+sudo systemctl stop diary-bot diary-viewer
+cp /opt/diary-bot/data/backups/sqlite/diary_YYYYMMDD_HHMMSS_ffffff.sqlite3 /opt/diary-bot/data/diary.sqlite3
+rm -f /opt/diary-bot/data/diary.sqlite3-wal /opt/diary-bot/data/diary.sqlite3-shm
+sudo systemctl start diary-bot diary-viewer
+```
